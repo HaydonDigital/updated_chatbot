@@ -4,26 +4,36 @@ import re
 import streamlit as st
 import os
 
-# Normalize special characters and finish codes
-def normalize_part_for_pricing(part):
-    part = str(part).strip().upper()
+# Build the pricing match key in exact format, e.g., "H-132-OS X 10' GREEN"
+def build_pricing_key(haydon_part):
+    if pd.isna(haydon_part):
+        return ""
 
-    # Normalize 'X 10' to "X 10'" to match pricing sheet format
-    part = re.sub(r"(X\s*\d+)(?!')", lambda m: m.group(1) + "'", part)
+    part = str(haydon_part).strip().upper()
 
-    # Map suffix codes to full descriptions
+    # Extract base, length, and finish
+    base_match = re.match(r"^(H-[0-9A-Z]+(?:-OS|OSA)?)", part)
+    length_match = re.search(r"X\s*(\d+)", part)
+    finish_match = re.search(r"\b(GR|PG|HDG|PL)\b", part)
+
+    base = base_match.group(1) if base_match else ""
+    length = length_match.group(1) + "'" if length_match else ""
     finish_map = {
         "GR": "GREEN",
-        "HDG": "HDG",
         "PG": "PRE GALV",
-        "PL": "PLAIN",
+        "HDG": "HDG",
+        "PL": "PLAIN"
     }
+    finish = finish_map.get(finish_match.group(1)) if finish_match else ""
 
-    for code, desc in finish_map.items():
-        part = re.sub(rf"\b{code}\b", desc, part)
+    # Assemble formatted name like in pricing sheet
+    components = [base]
+    if length:
+        components.append(f"X {length}")
+    if finish:
+        components.append(finish)
 
-    part = re.sub(r"\s{2,}", " ", part).strip()
-    return part
+    return " ".join(components).strip()
 
 def normalize(part):
     if pd.isna(part):
@@ -69,27 +79,26 @@ if query:
         pricing_path = os.path.join(os.path.dirname(__file__), "Standard Pricing - June 2025.xlsx")
         pricing_df = pd.read_excel(pricing_path)
         pricing_df["Name"] = pricing_df["Name"].astype(str).str.strip()
+
+        # Build match key using exact reconstruction
+        results["Pricing Key"] = results["Haydon Part #"].apply(build_pricing_key)
+
+        # Merge using the exact name
+        merged = pd.merge(results, pricing_df[["Name", "LESS THAN TRUCKLOAD PRICE"]],
+                          left_on="Pricing Key", right_on="Name", how="left")
+
+        # Fallback using Current Item Nbr
         pricing_df["Current Item Nbr"] = pricing_df["Current Item Nbr"].astype(str).str.strip()
-
-        # Create normalized key in both DataFrames
-        results["Pricing Key"] = results["Haydon Part #"].apply(normalize_part_for_pricing)
-        pricing_df["Pricing Key"] = pricing_df["Name"].apply(normalize_part_for_pricing)
-
-        # Merge on normalized key
-        merged = pd.merge(results, pricing_df[["Pricing Key", "LESS THAN TRUCKLOAD PRICE"]],
-                          on="Pricing Key", how="left")
-
-        # Fallback by Current Item Nbr
         fallback_merge = pd.merge(results, pricing_df[["Current Item Nbr", "LESS THAN TRUCKLOAD PRICE"]],
                                   left_on="Haydon Part #", right_on="Current Item Nbr", how="left")
 
+        # Combine both sources of price
         merged["Price"] = merged["LESS THAN TRUCKLOAD PRICE"]
         fallback_price = fallback_merge["LESS THAN TRUCKLOAD PRICE"]
         merged["Price"] = merged["Price"].fillna(fallback_price)
 
-        merged.drop(columns=["LESS THAN TRUCKLOAD PRICE", "Pricing Key"], inplace=True, errors="ignore")
+        merged.drop(columns=["LESS THAN TRUCKLOAD PRICE", "Name", "Pricing Key"], inplace=True, errors="ignore")
 
-        # DEBUG TABLE
         st.write("🔧 DEBUG PRICE MATCHING")
         st.dataframe(merged[["Haydon Part #", "Price"]])
 
