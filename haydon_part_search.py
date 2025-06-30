@@ -47,6 +47,22 @@ if query:
     results = search_parts(cross_ref_df, query)
 
     if not results.empty:
+        # Load pricing
+        pricing_path = os.path.join(os.path.dirname(__file__), "Standard Pricing - June 2025.xlsx")
+        pricing_df = pd.read_excel(pricing_path)
+
+        # Prepare pricing data
+        pricing_df["Current Item Nbr"] = pricing_df["Current Item Nbr"].astype(str).str.strip()
+        results["Haydon Part #"] = results["Haydon Part #"].astype(str).str.strip()
+
+        # Merge on Haydon Part #
+        results = pd.merge(results, pricing_df[["Current Item Nbr", "LESS THAN TRUCKLOAD PRICE"]],
+                           left_on="Haydon Part #", right_on="Current Item Nbr", how="left")
+
+        # Rename column for clarity
+        results.rename(columns={"LESS THAN TRUCKLOAD PRICE": "Price"}, inplace=True)
+        results.drop(columns=["Current Item Nbr"], inplace=True)
+
         st.subheader(f"Found {len(results)} matching entries")
         st.dataframe(results.drop(columns=["Normalized Haydon Part", "Normalized Vendor Part"]))
 
