@@ -4,23 +4,42 @@ import re
 import streamlit as st
 import os
 
-# Load the Excel data
+# Normalize special characters and finish codes
+def normalize_part_for_pricing(part):
+    part = str(part).strip().upper()
+
+    # Normalize 'X 10' to "X 10'" to match pricing sheet format
+    part = re.sub(r"(X\s*\d+)(?!')", lambda m: m.group(1) + "'", part)
+
+    # Map suffix codes to full descriptions
+    finish_map = {
+        "GR": "GREEN",
+        "HDG": "HDG",
+        "PG": "PRE GALV",
+        "PL": "PLAIN",
+    }
+
+    for code, desc in finish_map.items():
+        part = re.sub(rf"\b{code}\b", desc, part)
+
+    part = re.sub(r"\s{2,}", " ", part).strip()
+    return part
+
+def normalize(part):
+    if pd.isna(part):
+        return ""
+    return re.sub(r"[^A-Za-z0-9]", "", str(part)).lower()
+
 def load_cross_reference():
-    file_path = os.path.join(os.path.dirname(__file__), "Updated File - 3-24.xlsx")
-    df = pd.read_excel(file_path, sheet_name="Export", engine="openpyxl")
+    path = os.path.join(os.path.dirname(__file__), "Updated File - 3-24.xlsx")
+    df = pd.read_excel(path, sheet_name="Export", engine="openpyxl")
     df["Normalized Haydon Part"] = df["Haydon Part #"].apply(normalize)
     df["Normalized Vendor Part"] = df["Vendor Part #"].apply(normalize)
     return df
 
 def load_haydon_reference():
     path = os.path.join(os.path.dirname(__file__), "Image.xlsx")
-    df = pd.read_excel(path, sheet_name="Sheet1")
-    return df
-
-def normalize(part):
-    if pd.isna(part):
-        return ""
-    return re.sub(r"[^A-Za-z0-9]", "", str(part)).lower()
+    return pd.read_excel(path, sheet_name="Sheet1")
 
 def get_haydon_candidates(part):
     part = str(part).upper()
@@ -47,32 +66,31 @@ if query:
     results = search_parts(cross_ref_df, query)
 
     if not results.empty:
-        # Load pricing
         pricing_path = os.path.join(os.path.dirname(__file__), "Standard Pricing - June 2025.xlsx")
         pricing_df = pd.read_excel(pricing_path)
-
-        # Standardize fields
         pricing_df["Name"] = pricing_df["Name"].astype(str).str.strip()
         pricing_df["Current Item Nbr"] = pricing_df["Current Item Nbr"].astype(str).str.strip()
-        results["Haydon Part #"] = results["Haydon Part #"].astype(str).str.strip()
 
-        # Attempt primary merge on Name
-        merged = pd.merge(results, pricing_df[["Name", "LESS THAN TRUCKLOAD PRICE"]],
-                          left_on="Haydon Part #", right_on="Name", how="left")
+        # Create normalized key in both DataFrames
+        results["Pricing Key"] = results["Haydon Part #"].apply(normalize_part_for_pricing)
+        pricing_df["Pricing Key"] = pricing_df["Name"].apply(normalize_part_for_pricing)
 
-        # Fallback merge on Current Item Nbr
+        # Merge on normalized key
+        merged = pd.merge(results, pricing_df[["Pricing Key", "LESS THAN TRUCKLOAD PRICE"]],
+                          on="Pricing Key", how="left")
+
+        # Fallback by Current Item Nbr
         fallback_merge = pd.merge(results, pricing_df[["Current Item Nbr", "LESS THAN TRUCKLOAD PRICE"]],
                                   left_on="Haydon Part #", right_on="Current Item Nbr", how="left")
 
-        # Combine price sources
         merged["Price"] = merged["LESS THAN TRUCKLOAD PRICE"]
         fallback_price = fallback_merge["LESS THAN TRUCKLOAD PRICE"]
         merged["Price"] = merged["Price"].fillna(fallback_price)
 
-        merged.drop(columns=["LESS THAN TRUCKLOAD PRICE", "Name"], inplace=True, errors="ignore")
+        merged.drop(columns=["LESS THAN TRUCKLOAD PRICE", "Pricing Key"], inplace=True, errors="ignore")
 
-        # DEBUG OUTPUT
-        st.write("🔧 DEBUG MERGE RESULTS:")
+        # DEBUG TABLE
+        st.write("🔧 DEBUG PRICE MATCHING")
         st.dataframe(merged[["Haydon Part #", "Price"]])
 
         st.subheader(f"Found {len(merged)} matching entries")
