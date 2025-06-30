@@ -51,22 +51,30 @@ if query:
         pricing_path = os.path.join(os.path.dirname(__file__), "Standard Pricing - June 2025.xlsx")
         pricing_df = pd.read_excel(pricing_path)
 
-        # Prepare pricing data
+        # Standardize fields
+        pricing_df["Name"] = pricing_df["Name"].astype(str).str.strip()
         pricing_df["Current Item Nbr"] = pricing_df["Current Item Nbr"].astype(str).str.strip()
         results["Haydon Part #"] = results["Haydon Part #"].astype(str).str.strip()
 
-        # Merge on Haydon Part #
-        results = pd.merge(results, pricing_df[["Current Item Nbr", "LESS THAN TRUCKLOAD PRICE"]],
-                           left_on="Haydon Part #", right_on="Current Item Nbr", how="left")
+        # Attempt primary merge on Name
+        merged = pd.merge(results, pricing_df[["Name", "LESS THAN TRUCKLOAD PRICE"]],
+                          left_on="Haydon Part #", right_on="Name", how="left")
 
-        # Rename column for clarity
-        results.rename(columns={"LESS THAN TRUCKLOAD PRICE": "Price"}, inplace=True)
-        results.drop(columns=["Current Item Nbr"], inplace=True)
+        # Fill missing prices using fallback merge on Current Item Nbr
+        fallback_merge = pd.merge(results, pricing_df[["Current Item Nbr", "LESS THAN TRUCKLOAD PRICE"]],
+                                  left_on="Haydon Part #", right_on="Current Item Nbr", how="left")
 
-        st.subheader(f"Found {len(results)} matching entries")
-        st.dataframe(results.drop(columns=["Normalized Haydon Part", "Normalized Vendor Part"]))
+        # Fill price column with primary, then fallback
+        merged["Price"] = merged["LESS THAN TRUCKLOAD PRICE"]
+        fallback_price = fallback_merge["LESS THAN TRUCKLOAD PRICE"]
+        merged["Price"] = merged["Price"].fillna(fallback_price)
 
-        first_row = results.iloc[0]
+        merged.drop(columns=["LESS THAN TRUCKLOAD PRICE", "Name"], inplace=True, errors="ignore")
+
+        st.subheader(f"Found {len(merged)} matching entries")
+        st.dataframe(merged.drop(columns=["Normalized Haydon Part", "Normalized Vendor Part"], errors="ignore"))
+
+        first_row = merged.iloc[0]
         haydon_part = first_row["Haydon Part #"]
 
         with st.sidebar:
