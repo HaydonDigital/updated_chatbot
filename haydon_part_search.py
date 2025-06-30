@@ -60,16 +60,20 @@ if query:
         merged = pd.merge(results, pricing_df[["Name", "LESS THAN TRUCKLOAD PRICE"]],
                           left_on="Haydon Part #", right_on="Name", how="left")
 
-        # Fill missing prices using fallback merge on Current Item Nbr
+        # Fallback merge on Current Item Nbr
         fallback_merge = pd.merge(results, pricing_df[["Current Item Nbr", "LESS THAN TRUCKLOAD PRICE"]],
                                   left_on="Haydon Part #", right_on="Current Item Nbr", how="left")
 
-        # Fill price column with primary, then fallback
+        # Combine price sources
         merged["Price"] = merged["LESS THAN TRUCKLOAD PRICE"]
         fallback_price = fallback_merge["LESS THAN TRUCKLOAD PRICE"]
         merged["Price"] = merged["Price"].fillna(fallback_price)
 
         merged.drop(columns=["LESS THAN TRUCKLOAD PRICE", "Name"], inplace=True, errors="ignore")
+
+        # DEBUG OUTPUT
+        st.write("🔧 DEBUG MERGE RESULTS:")
+        st.dataframe(merged[["Haydon Part #", "Price"]])
 
         st.subheader(f"Found {len(merged)} matching entries")
         st.dataframe(merged.drop(columns=["Normalized Haydon Part", "Normalized Vendor Part"], errors="ignore"))
