@@ -99,10 +99,7 @@ if query:
 
         merged.drop(columns=["LESS THAN TRUCKLOAD PRICE", "Name", "Pricing Key"], inplace=True, errors="ignore")
 
-        st.write("🔧 DEBUG PRICE MATCHING")
-        st.dataframe(merged[["Haydon Part #", "Price"]])
-
-        st.subheader(f"Found {len(merged)} matching entries")
+                st.subheader(f"Found {len(merged)} matching entries")
         st.dataframe(merged.drop(columns=["Normalized Haydon Part", "Normalized Vendor Part"], errors="ignore"))
 
         first_row = merged.iloc[0]
