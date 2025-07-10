@@ -83,7 +83,9 @@ if query:
 
         enriched = pd.merge(
             enriched,
-            pricing_df[["Cross Reference Name", "Macola Number", "SAP Number", "LESS THAN TRUCKLOAD PRICE", "TRUCKLOAD PRICE"]],
+            pricing_df[
+    ["Cross Reference Name", "Macola Number", "SAP Number", "LESS THAN TRUCKLOAD PRICE", "TRUCKLOAD PRICE"]
+].drop_duplicates(subset=["Cross Reference Name"]),
             left_on="Haydon Part Description",
             right_on="Cross Reference Name",
             how="left"
