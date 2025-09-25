@@ -1,4 +1,3 @@
-
 import pandas as pd
 import re
 import streamlit as st
@@ -110,4 +109,10 @@ if query:
             if not match_found:
                 st.warning("No product preview or submittal found.")
     else:
-        st.warning("No matches found.")
+        st.error(
+            "No match found? Send the Haydon part number and the customer/competitor part number to "
+            "[marketing@haydoncorp.com](mailto:marketing@haydoncorp.com). "
+            "Prefer Teams? [Start a chat with Brock]"
+            "(https://teams.microsoft.com/l/chat/0/0?users=b.bernholtz@haydoncorp.com) "
+            "and include any details you have."
+        )
