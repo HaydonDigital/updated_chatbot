@@ -11,7 +11,6 @@ st.set_page_config(layout="wide", page_title="Haydon Cross-Reference Search")
 
 BASE_DIR = Path(__file__).parent
 CROSS_FILE = BASE_DIR / "Updated File - 7-10-25.xlsx"
-PRICING_FILE = BASE_DIR / "Standard Pricing - June 2025.xlsx"
 IMAGES_FILE = BASE_DIR / "Image and Submittals.xlsx"
 
 
@@ -29,11 +28,53 @@ def get_haydon_candidates(part):
     """
     Given a Haydon part like 'H-1234-XG', progressively shorten it
     so we can try to match in the image/submittal file.
+
+    IMPORTANT:
+    - Never yield overly-generic single-token candidates (e.g., 'N')
+      because that can cause bad matches like N-1200 being selected for N-802.
     """
-    part = str(part).upper()
+    part = str(part).upper().strip()
     tokens = re.split(r"[ \-X()]+", part)
-    for i in range(len(tokens), 0, -1):
+
+    # Only yield candidates with 2+ tokens (prevents 'N' only)
+    for i in range(len(tokens), 1, -1):
         yield "-".join(tokens[:i])
+
+
+def find_best_image_match(image_df: pd.DataFrame, haydon_part: str):
+    """
+    Match logic (in order):
+      1) Exact match on Name_upper
+      2) Startswith match on Name_upper (controlled fallback)
+         - chooses the closest match by smallest length difference
+
+    Returns:
+      (row, match_type, matched_name) or (None, None, None)
+    """
+    if image_df is None or image_df.empty or not haydon_part:
+        return None, None, None
+
+    candidates = [haydon_part] + list(get_haydon_candidates(haydon_part))
+
+    for candidate in candidates:
+        cand = str(candidate).upper().strip()
+
+        # 1) Exact match
+        exact = image_df[image_df["Name_upper"] == cand]
+        if not exact.empty:
+            row = exact.iloc[0]
+            return row, "exact", row.get("Name", cand)
+
+        # 2) Startswith match (fallback but still safe)
+        starts = image_df[image_df["Name_upper"].str.startswith(cand, na=False)]
+        if not starts.empty:
+            starts = starts.copy()
+            starts["len_diff"] = starts["Name_upper"].str.len() - len(cand)
+            starts = starts.sort_values(["len_diff", "Name_upper"])
+            row = starts.iloc[0]
+            return row, "startswith", row.get("Name", cand)
+
+    return None, None, None
 
 
 # =========================================================
@@ -50,27 +91,18 @@ def load_cross_reference():
 
 
 @st.cache_data
-def load_pricing():
-    if not PRICING_FILE.exists():
-        raise FileNotFoundError(f"Pricing file not found at: {PRICING_FILE}")
-    df = pd.read_excel(PRICING_FILE)
-    # standardize join key
-    df["Cross Reference Name"] = (
-        df["Cross Reference Name"].astype(str).str.strip().str.upper()
-    )
-    # drop dupes so merge is cleaner
-    df = df.drop_duplicates(subset=["Cross Reference Name"])
-    return df
-
-
-@st.cache_data
 def load_images():
     if not IMAGES_FILE.exists():
         raise FileNotFoundError(f"Image/submittals file not found at: {IMAGES_FILE}")
     df = pd.read_excel(IMAGES_FILE, sheet_name="Sheet1")
+
     # normalize name column for easier matching later
     if "Name" in df.columns:
-        df["Name_upper"] = df["Name"].astype(str).str.upper()
+        df["Name_upper"] = df["Name"].astype(str).str.upper().str.strip()
+    else:
+        # Ensure column exists to avoid KeyErrors later
+        df["Name_upper"] = ""
+
     return df
 
 
@@ -95,7 +127,6 @@ query = st.text_input("Enter part number (Haydon or Vendor):")
 if query:
     try:
         cross_df = load_cross_reference()
-        pricing_df = load_pricing()
         image_df = load_images()
     except FileNotFoundError as e:
         st.error(str(e))
@@ -104,35 +135,14 @@ if query:
     results = search_parts(cross_df, query)
 
     if not results.empty:
-        # enrich with pricing
-        enriched = pd.merge(
-            results,
-            pricing_df[
-                [
-                    "Cross Reference Name",
-                    "Macola\nItem",
-                    "SAP Item Nbr",
-                    "LESS THAN TRUCKLOAD PRICE",
-                    "TRUCKLOAD PRICE",
-                ]
-            ],
-            left_on="Haydon Part Description",
-            right_on="Cross Reference Name",
-            how="left",
-        )
-
-        # final display columns
+        # final display columns (pricing removed)
         display_cols = [
             "Vendor Part #",
             "Vendor",
             "Category",
             "Haydon Part Description",
-            "Macola\nItem",
-            "SAP Item Nbr",
-            "LESS THAN TRUCKLOAD PRICE",
-            "TRUCKLOAD PRICE",
         ]
-        display_df = enriched[[c for c in display_cols if c in enriched.columns]]
+        display_df = results[[c for c in display_cols if c in results.columns]]
 
         st.subheader(f"Found {len(display_df)} matching entries")
         st.dataframe(display_df, use_container_width=True)
@@ -140,32 +150,33 @@ if query:
         # -------------------------------------------------
         # Sidebar: product preview / submittals
         # -------------------------------------------------
-        first_row = enriched.iloc[0]
-        haydon_part = first_row["Haydon Part Description"]
+        first_row = results.iloc[0]
+        haydon_part = first_row.get("Haydon Part Description", "")
 
         with st.sidebar:
             st.markdown("### Haydon Product Preview")
-            match_found = False
-            # start from the exact part, then try shorter versions
-            candidates = [haydon_part] + list(get_haydon_candidates(haydon_part))
-            for candidate in candidates:
-                matched = image_df[image_df["Name_upper"] == str(candidate).upper()]
-                if not matched.empty:
-                    row = matched.iloc[0]
-                    # show image if present
-                    if "Cover Image" in row and pd.notna(row["Cover Image"]):
-                        st.image(
-                            row["Cover Image"],
-                            caption=row.get("Name", candidate),
-                            use_container_width=True,
-                        )
-                    # show submittal link if present
-                    if "Files" in row and pd.notna(row["Files"]):
-                        st.markdown(f"[View Submittal]({row['Files']})", unsafe_allow_html=True)
-                    match_found = True
-                    break
 
-            if not match_found:
+            row, match_type, matched_name = find_best_image_match(image_df, haydon_part)
+
+            if row is not None:
+                # Optional: show what matched for auditing
+                st.caption(f"Showing match ({match_type}): {matched_name}")
+
+                # show image if present
+                if "Cover Image" in row and pd.notna(row["Cover Image"]):
+                    st.image(
+                        row["Cover Image"],
+                        caption=row.get("Name", matched_name),
+                        use_container_width=True,
+                    )
+
+                # show submittal link if present
+                if "Files" in row and pd.notna(row["Files"]):
+                    st.markdown(
+                        f"[View Submittal for {row.get('Name', matched_name)}]({row['Files']})",
+                        unsafe_allow_html=True,
+                    )
+            else:
                 st.warning("No product preview or submittal found.")
     else:
         st.error(
