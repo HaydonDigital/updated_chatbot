@@ -13,6 +13,13 @@ BASE_DIR = Path(__file__).parent
 CROSS_FILE = BASE_DIR / "Updated File - 7-10-25.xlsx"
 IMAGES_FILE = BASE_DIR / "Image and Submittals.xlsx"
 
+# Optional PDF support (text-based PDFs)
+try:
+    from PyPDF2 import PdfReader
+    HAS_PYPDF2 = True
+except Exception:
+    HAS_PYPDF2 = False
+
 
 # =========================================================
 # UTILITY FUNCTIONS
@@ -22,6 +29,62 @@ def normalize(text):
     if pd.isna(text):
         return ""
     return re.sub(r"[^A-Za-z0-9]", "", str(text)).lower()
+
+
+def split_parts_from_text(raw: str) -> list[str]:
+    """Split pasted text into part tokens (newline/comma/space separated)."""
+    if not raw:
+        return []
+    tokens = re.split(r"[\n,;\t ]+", raw.strip())
+    return [t.strip() for t in tokens if t.strip()]
+
+
+def extract_text_from_pdf(uploaded_file) -> str:
+    """Extract text from a PDF (works for text-based PDFs, not scanned images)."""
+    if not HAS_PYPDF2:
+        return ""
+    reader = PdfReader(uploaded_file)
+    chunks = []
+    for page in reader.pages:
+        chunks.append(page.extract_text() or "")
+    return "\n".join(chunks)
+
+
+def extract_part_candidates_from_pdf_text(text: str) -> list[str]:
+    """
+    Pull likely part-number-like strings from PDF text.
+    Tune regex as needed to reduce noise.
+    """
+    if not text:
+        return []
+
+    # General "part-like" token: letters/numbers with -, /, ., # allowed
+    pattern = re.compile(r"\b[A-Z0-9][A-Z0-9\-\/\.\#]{3,39}\b", re.IGNORECASE)
+    hits = pattern.findall(text)
+
+    # Clean + dedupe preserving order
+    seen = set()
+    out = []
+    for h in hits:
+        h2 = h.strip().strip(".,;:()[]{}")
+        if len(h2) < 4:
+            continue
+        key = h2.upper()
+        if key not in seen:
+            seen.add(key)
+            out.append(h2)
+    return out
+
+
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen = set()
+    out = []
+    for x in items:
+        k = (x or "").strip().upper()
+        if k and k not in seen:
+            seen.add(k)
+            out.append((x or "").strip())
+    return out
 
 
 def get_haydon_candidates(part):
@@ -61,7 +124,8 @@ def load_images():
 # =========================================================
 # SEARCH
 # =========================================================
-def search_parts(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
+def search_parts_contains(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Contains search (your current behavior)."""
     norm_query = normalize(query)
     return cross_df[
         cross_df["Normalized Haydon Part"].str.contains(norm_query, na=False)
@@ -69,74 +133,185 @@ def search_parts(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
     ]
 
 
+def search_parts_exact(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
+    """Exact match on normalized values (recommended for bulk)."""
+    norm_query = normalize(query)
+    if not norm_query:
+        return cross_df.iloc[0:0]
+    return cross_df[
+        (cross_df["Normalized Haydon Part"] == norm_query)
+        | (cross_df["Normalized Vendor Part"] == norm_query)
+    ]
+
+
+def bulk_search(cross_df: pd.DataFrame, parts: list[str], allow_contains_fallback: bool) -> pd.DataFrame:
+    """
+    Flattened output: one row per match (or one row per input if not found).
+    """
+    rows = []
+    for raw in parts:
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+
+        found = search_parts_exact(cross_df, raw)
+        if found.empty and allow_contains_fallback:
+            found = search_parts_contains(cross_df, raw)
+
+        if found.empty:
+            rows.append(
+                {
+                    "Input": raw,
+                    "Status": "Not Found",
+                    "Vendor Part #": None,
+                    "Vendor": None,
+                    "Category": None,
+                    "Haydon Part Description": None,
+                    "Match Count (for Input)": 0,
+                }
+            )
+        else:
+            for _, r in found.iterrows():
+                rows.append(
+                    {
+                        "Input": raw,
+                        "Status": "Found",
+                        "Vendor Part #": r.get("Vendor Part #"),
+                        "Vendor": r.get("Vendor"),
+                        "Category": r.get("Category"),
+                        "Haydon Part Description": r.get("Haydon Part Description"),
+                        "Match Count (for Input)": len(found),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
 # =========================================================
 # APP UI
 # =========================================================
 st.title("Haydon Cross-Reference Search")
 
-query = st.text_input("Enter part number (Haydon or Vendor):")
+try:
+    cross_df = load_cross_reference()
+    image_df = load_images()
+except FileNotFoundError as e:
+    st.error(str(e))
+    st.stop()
 
-if query:
-    try:
-        cross_df = load_cross_reference()
-        image_df = load_images()
-    except FileNotFoundError as e:
-        st.error(str(e))
-        st.stop()
+tab_single, tab_bulk = st.tabs(["Single", "Bulk"])
 
-    results = search_parts(cross_df, query)
+# =========================================================
+# SINGLE
+# =========================================================
+with tab_single:
+    query = st.text_input("Enter part number (Haydon or Vendor):")
 
-    if not results.empty:
-        display_cols = [
-            "Vendor Part #",
-            "Vendor",
-            "Category",
-            "Haydon Part Description",
-        ]
+    if query:
+        results = search_parts_contains(cross_df, query)
 
-        display_df = results[[c for c in display_cols if c in results.columns]]
+        if not results.empty:
+            display_cols = ["Vendor Part #", "Vendor", "Category", "Haydon Part Description"]
+            display_df = results[[c for c in display_cols if c in results.columns]]
 
-        st.subheader(f"Found {len(display_df)} matching entries")
-        st.dataframe(display_df, use_container_width=True)
+            st.subheader(f"Found {len(display_df)} matching entries")
+            st.dataframe(display_df, use_container_width=True)
 
-        # -------------------------------------------------
-        # Sidebar: product preview / submittals
-        # -------------------------------------------------
-        first_row = results.iloc[0]
-        haydon_part = first_row["Haydon Part Description"]
+            # Sidebar: product preview / submittals for first result
+            first_row = results.iloc[0]
+            haydon_part = first_row["Haydon Part Description"]
 
-        with st.sidebar:
-            st.markdown("### Haydon Product Preview")
-            match_found = False
+            with st.sidebar:
+                st.markdown("### Haydon Product Preview")
+                match_found = False
 
-            candidates = [haydon_part] + list(get_haydon_candidates(haydon_part))
-            for candidate in candidates:
-                matched = image_df[image_df["Name_upper"] == str(candidate).upper()]
-                if not matched.empty:
-                    row = matched.iloc[0]
+                candidates = [haydon_part] + list(get_haydon_candidates(haydon_part))
+                for candidate in candidates:
+                    matched = image_df[image_df["Name_upper"] == str(candidate).upper()]
+                    if not matched.empty:
+                        row = matched.iloc[0]
 
-                    if "Cover Image" in row and pd.notna(row["Cover Image"]):
-                        st.image(
-                            row["Cover Image"],
-                            caption=row.get("Name", candidate),
-                            use_container_width=True,
-                        )
+                        if "Cover Image" in row and pd.notna(row["Cover Image"]):
+                            st.image(
+                                row["Cover Image"],
+                                caption=row.get("Name", candidate),
+                                use_container_width=True,
+                            )
 
-                    if "Files" in row and pd.notna(row["Files"]):
-                        st.markdown(
-                            f"[View Submittal]({row['Files']})",
-                            unsafe_allow_html=True,
-                        )
+                        if "Files" in row and pd.notna(row["Files"]):
+                            st.markdown(f"[View Submittal]({row['Files']})", unsafe_allow_html=True)
 
-                    match_found = True
-                    break
+                        match_found = True
+                        break
 
-            if not match_found:
-                st.warning("No product preview or submittal found.")
+                if not match_found:
+                    st.warning("No product preview or submittal found.")
+        else:
+            st.error(
+                "No match found. Send the Haydon part number and the customer/competitor part number to "
+                "[marketing@haydoncorp.com](mailto:marketing@haydoncorp.com)."
+            )
     else:
-        st.error(
-            "No match found. Send the Haydon part number and the customer/competitor part number to "
-            "[marketing@haydoncorp.com](mailto:marketing@haydoncorp.com)."
+        st.write("Enter a part number above to begin.")
+
+# =========================================================
+# BULK
+# =========================================================
+with tab_bulk:
+    st.markdown("Paste a list of parts and/or upload a PDF to cross-reference in bulk.")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        pasted = st.text_area(
+            "Paste part numbers (one per line, or comma/space separated):",
+            height=220,
+            placeholder="Example:\nPS-1100-AS-4-EG\nTSN-802\nP1000",
         )
-else:
-    st.write("Enter a part number above to begin.")
+
+    with col2:
+        pdf = st.file_uploader("Upload a PDF (text-based PDFs):", type=["pdf"])
+        allow_contains = st.checkbox(
+            "If exact match fails, try contains fallback (may increase false matches)",
+            value=True,
+        )
+        if pdf is not None and not HAS_PYPDF2:
+            st.warning("PyPDF2 is not installed in this environment. Add it to requirements.txt to enable PDF parsing.")
+
+    parts = []
+    if pasted and pasted.strip():
+        parts.extend(split_parts_from_text(pasted))
+
+    if pdf is not None and HAS_PYPDF2:
+        pdf_text = extract_text_from_pdf(pdf)
+        if not pdf_text.strip():
+            st.warning("Could not extract text from this PDF (it may be scanned or protected).")
+        else:
+            candidates = extract_part_candidates_from_pdf_text(pdf_text)
+            st.info(f"Extracted {len(candidates)} candidate tokens from the PDF.")
+            with st.expander("View extracted candidates"):
+                st.write(candidates)
+            parts.extend(candidates)
+
+    parts_unique = dedupe_preserve_order(parts)
+
+    st.write(f"Inputs ready: {len(parts_unique)}")
+
+    run = st.button("Run Bulk Cross-Reference", type="primary", disabled=(len(parts_unique) == 0))
+
+    if run:
+        out_df = bulk_search(cross_df, parts_unique, allow_contains_fallback=allow_contains)
+
+        st.subheader(f"Bulk Results ({len(out_df)} rows)")
+        st.dataframe(out_df, use_container_width=True)
+
+        found_rows = int((out_df["Status"] == "Found").sum())
+        not_found_rows = int((out_df["Status"] == "Not Found").sum())
+        st.write(f"Found rows: {found_rows} | Not found rows: {not_found_rows}")
+
+        csv_bytes = out_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download results as CSV",
+            data=csv_bytes,
+            file_name="haydon_cross_reference_bulk_results.csv",
+            mime="text/csv",
+        )
