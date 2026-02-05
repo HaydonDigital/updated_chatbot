@@ -5,23 +5,6 @@ import pandas as pd
 import streamlit as st
 
 # =========================================================
-# PDF SUPPORT (text + OCR fallback)
-# =========================================================
-try:
-    from PyPDF2 import PdfReader  # pip install PyPDF2
-    HAS_PYPDF2 = True
-except Exception:
-    HAS_PYPDF2 = False
-
-try:
-    from pdf2image import convert_from_bytes  # pip install pdf2image
-    import pytesseract  # pip install pytesseract
-    HAS_OCR = True
-except Exception:
-    HAS_OCR = False
-
-
-# =========================================================
 # CONFIG
 # =========================================================
 st.set_page_config(layout="wide", page_title="Haydon Cross-Reference Search")
@@ -34,7 +17,7 @@ IMAGES_FILE = BASE_DIR / "Image and Submittals.xlsx"
 # =========================================================
 # UTILITY FUNCTIONS
 # =========================================================
-def normalize(text) -> str:
+def normalize(text):
     """Strip non-alphanumerics and lowercase for matching."""
     if pd.isna(text):
         return ""
@@ -60,10 +43,10 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
     return out
 
 
-def get_haydon_candidates(part: str):
+def get_haydon_candidates(part):
     """
-    Progressively shorten a Haydon part so we can try to match the image/submittal file.
-    (kept exactly as your existing logic expects)
+    Given a Haydon part like 'H-1234-XG', progressively shorten it
+    so we can try to match in the image/submittal file.
     """
     part = str(part).upper()
     tokens = re.split(r"[ \-X()]+", part)
@@ -72,145 +55,7 @@ def get_haydon_candidates(part: str):
 
 
 # =========================================================
-# PDF TEXT + OCR EXTRACTION
-# =========================================================
-def extract_text_from_pdf_text_layer(uploaded_file) -> str:
-    """Extract embedded text from a text-based PDF. Returns '' if not possible."""
-    if not HAS_PYPDF2:
-        return ""
-    try:
-        reader = PdfReader(uploaded_file)
-        pages_text = []
-        for page in reader.pages:
-            pages_text.append(page.extract_text() or "")
-        return "\n".join(pages_text)
-    except Exception:
-        return ""
-
-
-def extract_text_from_pdf_ocr(uploaded_file, dpi: int = 250, max_pages: int = 5) -> str:
-    """
-    OCR scanned PDFs (image-based).
-    Requires:
-      - pdf2image + pytesseract
-      - System packages: poppler-utils, tesseract-ocr
-    """
-    if not HAS_OCR:
-        return ""
-    try:
-        pdf_bytes = uploaded_file.getvalue()
-        images = convert_from_bytes(
-            pdf_bytes,
-            dpi=dpi,
-            first_page=1,
-            last_page=max_pages,
-        )
-        chunks = []
-        for img in images:
-            chunks.append(pytesseract.image_to_string(img))
-        return "\n".join(chunks)
-    except Exception:
-        return ""
-
-
-def extract_text_smart(uploaded_file, ocr_enabled: bool, ocr_dpi: int, ocr_pages: int) -> str:
-    """Try text-layer extraction first; if empty and OCR enabled, run OCR."""
-    try:
-        uploaded_file.seek(0)
-    except Exception:
-        pass
-
-    text = extract_text_from_pdf_text_layer(uploaded_file)
-    if text and len(text.strip()) > 50:
-        return text
-
-    if not ocr_enabled:
-        return text or ""
-
-    try:
-        uploaded_file.seek(0)
-    except Exception:
-        pass
-
-    return extract_text_from_pdf_ocr(uploaded_file, dpi=ocr_dpi, max_pages=ocr_pages) or ""
-
-
-# =========================================================
-# STRICT PART EXTRACTION (UPDATED)
-# =========================================================
-def _ocr_cleanup(text: str) -> str:
-    """Normalize common OCR quirks so part patterns match more reliably."""
-    if not text:
-        return ""
-    text = text.replace("\u00ad", "")  # soft hyphen
-    text = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2212]", "-", text)  # dash variants -> '-'
-    text = re.sub(r"[ \t]+", " ", text)
-    return text
-
-
-def extract_parts_strict(text: str) -> list[str]:
-    """
-    Extract ONLY likely part numbers (reduce noise from OCR).
-    Adjust patterns if needed to match your real-world inputs.
-
-    Included patterns:
-      - EG0815-10, EG0840-20, EG0815-B (Elgen-style)
-      - G582-A-OS-1 (G-Strut-style)
-      - H132-OSA (Haydon-style example)
-      - PS-1100-AS-4-EG (your PS-style)
-    """
-    if not text:
-        return []
-
-    text = _ocr_cleanup(text).upper()
-
-    patterns = [
-        r"\bEG\d{4}-[A-Z0-9]{1,4}\b",
-        r"\bG\d{3,4}(?:-[A-Z0-9]{1,6}){2,5}\b",
-        r"\bH\d{3,5}(?:-[A-Z0-9]{1,6}){1,4}\b",
-        r"\bPS(?:-[A-Z0-9]{1,10}){2,8}\b",
-    ]
-
-    hits: list[str] = []
-    for pat in patterns:
-        hits.extend(re.findall(pat, text))
-
-    bad_exact = {
-        "DATE", "QTY", "UNIT", "PRICE", "TOTAL", "SHIP", "SHIPPING",
-        "SUBTOTAL", "TAX", "INVOICE", "QUOTE", "RFQ", "PO", "ITEM",
-        "DESCRIPTION", "PART", "NUMBER", "VENDOR",
-    }
-
-    def is_junk(token: str) -> bool:
-        if len(token) < 5:
-            return True
-        if token in bad_exact:
-            return True
-        if not re.search(r"\d", token):  # parts usually contain digits
-            return True
-        if re.fullmatch(r"\d{1,2}-\d{1,2}-\d{2,4}", token):
-            return True
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", token):
-            return True
-        if re.fullmatch(r"\d{8,}", token):
-            return True
-        return False
-
-    out = []
-    seen = set()
-    for h in hits:
-        h2 = h.strip().strip(".,;:()[]{}")
-        if is_junk(h2):
-            continue
-        if h2 not in seen:
-            seen.add(h2)
-            out.append(h2)
-
-    return out
-
-
-# =========================================================
-# DATA LOADERS
+# DATA LOADERS (CACHED)
 # =========================================================
 @st.cache_data
 def load_cross_reference():
@@ -231,11 +76,8 @@ def load_images():
     if not IMAGES_FILE.exists():
         raise FileNotFoundError(f"Image/submittals file not found at: {IMAGES_FILE}")
     df = pd.read_excel(IMAGES_FILE, sheet_name="Sheet1")
-
     if "Name" in df.columns:
         df["Name_upper"] = df["Name"].astype(str).str.upper()
-    else:
-        df["Name_upper"] = ""
     return df
 
 
@@ -308,7 +150,6 @@ def bulk_search(cross_df: pd.DataFrame, parts: list[str], allow_contains_fallbac
 # =========================================================
 st.title("Haydon Cross-Reference Search")
 
-# Load data once
 try:
     cross_df = load_cross_reference()
     image_df = load_images()
@@ -320,7 +161,7 @@ tab_single, tab_bulk = st.tabs(["Single", "Bulk"])
 
 
 # =========================================================
-# SINGLE TAB (UNCHANGED SIDEBAR BEHAVIOR)
+# SINGLE TAB (SIDEBAR UNCHANGED)
 # =========================================================
 with tab_single:
     query = st.text_input("Enter part number (Haydon or Vendor):")
@@ -329,12 +170,7 @@ with tab_single:
         results = search_parts(cross_df, query)
 
         if not results.empty:
-            display_cols = [
-                "Vendor Part #",
-                "Vendor",
-                "Category",
-                "Haydon Part Description",
-            ]
+            display_cols = ["Vendor Part #", "Vendor", "Category", "Haydon Part Description"]
             display_df = results[[c for c in display_cols if c in results.columns]]
 
             st.subheader(f"Found {len(display_df)} matching entries")
@@ -343,7 +179,6 @@ with tab_single:
             first_row = results.iloc[0]
             haydon_part = first_row["Haydon Part Description"]
 
-            # Sidebar stays exactly as-is (no changes to its layout/behavior)
             with st.sidebar:
                 st.markdown("### Haydon Product Preview")
                 match_found = False
@@ -382,76 +217,29 @@ with tab_single:
 
 
 # =========================================================
-# BULK TAB (NEW) - NO SIDEBAR CHANGES
+# BULK TAB (PASTE LIST ONLY)
 # =========================================================
 with tab_bulk:
-    st.markdown("Paste part numbers and/or upload a PDF to cross-reference in bulk.")
+    st.markdown("Paste a list of part numbers to cross-reference in bulk.")
 
-    col1, col2 = st.columns(2)
+    pasted = st.text_area(
+        "Paste part numbers (one per line, or comma/space separated):",
+        height=260,
+        placeholder="Example:\nPS-1100-AS-4-EG\nG582-A-OS-1\nEG0815-10",
+    )
 
-    with col1:
-        pasted = st.text_area(
-            "Paste part numbers (one per line, or comma/space separated):",
-            height=220,
-            placeholder="Example:\nPS-1100-AS-4-EG\nG582-A-OS-1\nEG0815-10",
-        )
+    allow_contains = st.checkbox(
+        "If exact match fails, try contains fallback (may increase false matches)",
+        value=True,
+    )
 
-    with col2:
-        pdf = st.file_uploader("Upload a PDF:", type=["pdf"])
+    parts = dedupe_preserve_order(split_parts_from_text(pasted))
+    st.write(f"Inputs ready: {len(parts)}")
 
-        allow_contains = st.checkbox(
-            "If exact match fails, try contains fallback (may increase false matches)",
-            value=True,
-        )
-
-        st.markdown("PDF scan options")
-        ocr_enabled = st.checkbox(
-            "Enable OCR fallback for scanned PDFs",
-            value=True,
-            disabled=not HAS_OCR,
-        )
-        ocr_pages = st.number_input("OCR pages (first N pages)", min_value=1, max_value=50, value=5, step=1)
-        ocr_dpi = st.number_input("OCR DPI (higher = better, slower)", min_value=150, max_value=400, value=250, step=10)
-
-        if pdf is not None:
-            if not HAS_PYPDF2:
-                st.info("PyPDF2 not available. Add PyPDF2 to requirements.txt for text-based PDF extraction.")
-            if not HAS_OCR:
-                st.info(
-                    "OCR not available. Add pdf2image and pytesseract to requirements.txt, and install "
-                    "system packages poppler-utils and tesseract-ocr."
-                )
-
-    parts = []
-    if pasted and pasted.strip():
-        parts.extend(split_parts_from_text(pasted))
-
-    extracted_candidates = []
-    if pdf is not None:
-        extracted_text = extract_text_smart(
-            pdf,
-            ocr_enabled=bool(ocr_enabled),
-            ocr_dpi=int(ocr_dpi),
-            ocr_pages=int(ocr_pages),
-        )
-
-        if not extracted_text or len(extracted_text.strip()) < 20:
-            st.warning("Could not extract text from this PDF (it may be protected, or OCR is not set up).")
-        else:
-            extracted_candidates = extract_parts_strict(extracted_text)
-            st.info(f"Extracted {len(extracted_candidates)} part numbers from the PDF.")
-            with st.expander("View extracted parts"):
-                st.write(extracted_candidates)
-
-            parts.extend(extracted_candidates)
-
-    parts_unique = dedupe_preserve_order(parts)
-    st.write(f"Inputs ready: {len(parts_unique)}")
-
-    run = st.button("Run Bulk Cross-Reference", type="primary", disabled=(len(parts_unique) == 0))
+    run = st.button("Run Bulk Cross-Reference", type="primary", disabled=(len(parts) == 0))
 
     if run:
-        out_df = bulk_search(cross_df, parts_unique, allow_contains_fallback=allow_contains)
+        out_df = bulk_search(cross_df, parts, allow_contains_fallback=allow_contains)
 
         st.subheader(f"Bulk Results ({len(out_df)} rows)")
         st.dataframe(out_df, use_container_width=True)
