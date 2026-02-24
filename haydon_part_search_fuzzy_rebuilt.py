@@ -27,8 +27,6 @@ FINISH_TOKENS = {
     "SS", "SST", "STAINLESS", "AL", "ALUM", "ALUMINUM", "PLAIN", "STEEL"
 }
 
-SLOT_TOKENS = {"OS", "OS3", "SLOT", "SLOTTED", "OPEN", "OPENSLOT", "OPEN-SLOT"}
-
 def normalize_common(s: str) -> str:
     """Normalize punctuation/spacing so tokens are consistent for keying/matching."""
     if pd.isna(s) or s is None:
@@ -54,7 +52,7 @@ def normalize_common(s: str) -> str:
     return s
 
 def key_full(s: str) -> str:
-    """Full key: keep important tokens (incl. finish/slot), strip punctuation/spaces."""
+    """Full key: keep important tokens (incl. finish), strip punctuation/spaces."""
     s = normalize_common(s)
     return re.sub(r"[^A-Z0-9]", "", s)
 
@@ -120,7 +118,6 @@ def float_to_inches_str(x: float) -> str:
     """Normalize numeric inches back to common text (e.g., 1.625 -> 1-5/8")."""
     if x is None:
         return ""
-    # common eighths for strut dimensions
     eighths = round(x * 8)
     whole = eighths // 8
     rem = eighths % 8
@@ -147,12 +144,10 @@ def extract_gauge(desc: str):
 def extract_length(desc: str):
     s = normalize_desc_text(desc)
 
-    # feet: 10', 10 ft, 10ft
     m = re.search(r"\b(\d{1,2})\s*(?:'|ft\b)", s, flags=re.I)
     if m:
         return f"{int(m.group(1))}'"
 
-    # inches: 120", 12"
     m = re.search(r"\b(\d{1,3})\s*\"\b", s)
     if m:
         return f"{int(m.group(1))}\""
@@ -162,10 +157,9 @@ def extract_length(desc: str):
 def extract_finish(desc: str):
     s = normalize_desc_text(desc).upper()
 
-    # Strong, explicit patterns first
-    if ("PRE" in s and "GALV" in s) or ("PREGALV" in s) or ("PRE-GALV" in s) or ("PG" in s):
+    if ("PRE" in s and "GALV" in s) or ("PREGALV" in s) or ("PRE-GALV" in s) or re.search(r"\bPG\b", s):
         return "Pre-Galvanized"
-    if ("HOT" in s and "DIP" in s) or ("HDG" in s):
+    if ("HOT" in s and "DIP" in s) or re.search(r"\bHDG\b", s):
         return "Hot Dipped Galvanized"
     if "ELECTRO" in s or re.search(r"\bEG\b", s):
         return "Electro Galvanized"
@@ -184,32 +178,35 @@ def is_slotted(desc: str) -> bool:
     return ("SLOT" in s) or ("OPEN SLOT" in s) or ("SLOTTED" in s) or ("SLOTTED HOLES" in s)
 
 def looks_like_long_description(q: str) -> bool:
-    """Heuristic: treat as long description if it has spaces and dimension/gauge-ish tokens."""
+    """
+    Heuristic: treat as long description if it looks like a sentence/product phrase
+    with material/finish/dimension keywords. (Avoid routing simple short labels to material matcher.)
+    """
     if not q:
         return False
-    s = str(q)
-    if len(s) < 10:
+    s = str(q).strip()
+    if len(s) < 12:
         return False
     if " " not in s:
         return False
     s2 = s.lower()
-    return any(t in s2 for t in ['gauge', 'ga', 'galv', 'slotted', 'channel', 'steel', 'stainless', 'aluminum', '"', "'"])
+    return any(t in s2 for t in [
+        'gauge', 'ga', 'galv', 'pre-galv', 'pregalv', 'hdg', 'hot dip',
+        'slotted', 'channel', 'strut', 'steel', 'stainless', 'aluminum', '"', "'"
+    ])
 
 # =========================================================
 # BULK INPUT HELPERS
 # =========================================================
 def split_parts_from_text(raw: str) -> list[str]:
-    """Split pasted text into part tokens (newline/comma/space separated)."""
+    """
+    Split pasted text into inputs.
+    IMPORTANT: keep spaces inside long descriptions, so only split on newline/comma/semicolon/tab.
+    """
     if not raw:
         return []
-    tokens = re.split(r"[\n,;\t]+", raw.strip())  # keep spaces inside long descriptions
-    out = []
-    for t in tokens:
-        t = t.strip()
-        if not t:
-            continue
-        out.append(t)
-    return out
+    tokens = re.split(r"[\n,;\t]+", raw.strip())
+    return [t.strip() for t in tokens if t and t.strip()]
 
 def dedupe_preserve_order(items: list[str]) -> list[str]:
     seen = set()
@@ -225,14 +222,11 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
 # IMAGE/SUBMITTAL CANDIDATES (naming convention tolerant)
 # =========================================================
 def get_haydon_candidates(part: str):
-    """
-    Generate likely lookup variants for image/submittal Name matching.
-    """
+    """Generate likely lookup variants for image/submittal Name matching."""
     p = normalize_common(part)
     variants = set()
 
     variants.add(p)
-    variants.add(p.replace(" X ", " X"))
     variants.add(p.replace(" X ", "X"))
     variants.add(p.replace("-", " - "))
     variants.add(p.replace(" - ", "-"))
@@ -242,7 +236,6 @@ def get_haydon_candidates(part: str):
     tokens = [t for t in tokens if t and t.replace(".", "") not in FINISH_TOKENS]
     variants.add(" ".join(tokens))
 
-    # yield longest-first
     for v in sorted(variants, key=len, reverse=True):
         yield v
 
@@ -256,11 +249,16 @@ def load_cross_reference():
 
     df = pd.read_excel(CROSS_FILE, sheet_name="Export", engine="openpyxl")
 
-    # Robust keys for matching
+    # Robust keys for matching (Haydon, Vendor, and Category)
     df["HaydonKeyFull"] = df["Haydon Part Description"].apply(key_full)
     df["HaydonKeyBase"] = df["Haydon Part Description"].apply(key_base)
+
     df["VendorKeyFull"] = df["Vendor Part #"].apply(key_full)
     df["VendorKeyBase"] = df["Vendor Part #"].apply(key_base)
+
+    # ✅ Category is where many descriptive entries live (washers, etc.)
+    df["CategoryKeyFull"] = df["Category"].apply(key_full)
+    df["CategoryKeyBase"] = df["Category"].apply(key_base)
 
     return df
 
@@ -280,13 +278,16 @@ def load_material_descriptions():
         raise FileNotFoundError(f"Material Description file not found at: {MATERIAL_DESC_FILE}")
     df = pd.read_excel(MATERIAL_DESC_FILE, engine="openpyxl")
 
-    # Normalized helpers for fast filtering
     if "Material Description" in df.columns:
         df["_desc_norm"] = df["Material Description"].astype(str).map(normalize_desc_text).str.upper()
     else:
         df["_desc_norm"] = ""
 
-    for c in ["Width", "Height", "Length", "Gauge", "Material Group 1 Name", "Material Group Name", "Material Group 3 Name", "Weight Each"]:
+    for c in [
+        "Width", "Height", "Length", "Gauge",
+        "Material Group 1 Name", "Material Group Name", "Material Group 3 Name",
+        "Weight Each"
+    ]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
 
@@ -304,8 +305,10 @@ def search_parts_exact(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
     return cross_df[
         (cross_df["HaydonKeyFull"].eq(qf)) |
         (cross_df["VendorKeyFull"].eq(qf)) |
+        (cross_df["CategoryKeyFull"].eq(qf)) |
         (cross_df["HaydonKeyBase"].eq(qb)) |
-        (cross_df["VendorKeyBase"].eq(qb))
+        (cross_df["VendorKeyBase"].eq(qb)) |
+        (cross_df["CategoryKeyBase"].eq(qb))
     ]
 
 def search_parts_contains(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
@@ -317,8 +320,10 @@ def search_parts_contains(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
     return cross_df[
         cross_df["HaydonKeyFull"].str.contains(qf, na=False) |
         cross_df["VendorKeyFull"].str.contains(qf, na=False) |
+        cross_df["CategoryKeyFull"].str.contains(qf, na=False) |
         cross_df["HaydonKeyBase"].str.contains(qb, na=False) |
-        cross_df["VendorKeyBase"].str.contains(qb, na=False)
+        cross_df["VendorKeyBase"].str.contains(qb, na=False) |
+        cross_df["CategoryKeyBase"].str.contains(qb, na=False)
     ]
 
 # =========================================================
@@ -340,12 +345,11 @@ def match_long_description(material_df: pd.DataFrame, query: str) -> pd.DataFram
 
     df = material_df
 
-    # Prefer strut rows if the file has the category column
+    # Prefer framing/strut items if the column exists
     if "Material Group Name" in df.columns:
-        # Keep Strut and related framing items; adjust if your file uses different terms
         df = df[df["Material Group Name"].astype(str).str.contains("STRUT|CHANNEL|FRAM", case=False, na=False)]
 
-    # Fast filters where available
+    # Fast filters
     if width_in is not None and "Width" in df.columns:
         width_text = float_to_inches_str(width_in).replace(" ", "")
         df = df[df["Width"].astype(str).str.replace(" ", "").str.contains(width_text, na=False)]
@@ -365,7 +369,6 @@ def match_long_description(material_df: pd.DataFrame, query: str) -> pd.DataFram
     if df.empty:
         return df
 
-    # Internal ranking (no score column returned)
     def score_row(r) -> int:
         s = 0
 
@@ -382,16 +385,10 @@ def match_long_description(material_df: pd.DataFrame, query: str) -> pd.DataFram
         if slotted and "Material Group 3 Name" in r and "SLOT" in str(r.get("Material Group 3 Name", "")).upper():
             s += 2
 
-        # Gentle hint: if user says "W channel" prefer the common 1-5/8 x 1-5/8 family when possible
         if ("CHANNEL" in q_up or "W CHANNEL" in q_up) and "Material Description" in r:
             md = str(r.get("Material Description", "")).upper()
             if "H-132" in md:
                 s += 1
-
-        # If user says "washer" prefer washer groups
-        if "WASHER" in q_up and "Material Group Name" in r:
-            if "WASH" in str(r.get("Material Group Name", "")).upper():
-                s += 2
 
         return s
 
@@ -491,7 +488,7 @@ tab_single, tab_bulk = st.tabs(["Single", "Bulk"])
 # SINGLE
 # =========================================================
 with tab_single:
-    query = st.text_input("Enter part number (Haydon or Vendor) OR paste a long description:")
+    query = st.text_input("Enter part number (Haydon/Vendor), Category phrase, OR paste a long description:")
 
     if query:
         used_material = looks_like_long_description(query)
@@ -534,8 +531,7 @@ with tab_single:
                     st.markdown("### Haydon Product Preview")
                     match_found = False
 
-                    candidates = list(get_haydon_candidates(haydon_part))
-                    for candidate in candidates:
+                    for candidate in get_haydon_candidates(haydon_part):
                         matched = image_df[image_df.get("Name_upper", "").astype(str) == str(candidate).upper()]
                         if not matched.empty:
                             row = matched.iloc[0]
@@ -561,14 +557,14 @@ with tab_single:
                     "[marketing@haydoncorp.com](mailto:marketing@haydoncorp.com)."
                 )
     else:
-        st.write("Enter a part number or long description above to begin.")
+        st.write("Enter a part number, category phrase, or long description above to begin.")
 
 # =========================================================
 # BULK (no PDF upload)
 # =========================================================
 with tab_bulk:
     st.markdown(
-        "Paste a list of parts/descriptions (one per line). "
+        "Paste a list of inputs (one per line). "
         "Tip: keep long descriptions on a single line."
     )
 
@@ -578,7 +574,7 @@ with tab_bulk:
         pasted = st.text_area(
             "Paste inputs (one per line):",
             height=220,
-            placeholder="Example:\nP1000 SL 10PG\nH-112 X 10' HDG\n1-5/8\" W Channel w/ Slotted Holes - Steel Pre-Galvanized 12 Gauge",
+            placeholder="Example:\nP1000 SL 10PG\nH-112 X 10' HDG\nSQUARE WASHER - 1 5/8 in x 1 5/8 in\n1-5/8\" W Channel w/ Slotted Holes - Steel Pre-Galvanized 12 Gauge",
         )
 
     with col2:
@@ -589,7 +585,6 @@ with tab_bulk:
 
     parts = []
     if pasted and pasted.strip():
-        # Split by newline/tab/comma/semicolon but preserve spaces for long descriptions
         parts.extend(split_parts_from_text(pasted))
 
     parts_unique = dedupe_preserve_order(parts)
