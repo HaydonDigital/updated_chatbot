@@ -76,7 +76,9 @@ def key_base(s: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", " ".join(cleaned))
 
 # =========================================================
-# ORDER-INSENSITIVE TOKEN MATCHING (fixes: "1/4 flat washer" vs "FLAT WASHER 1/4")
+# ORDER-INSENSITIVE TOKEN MATCHING
+#   Fixes: "1/4 flat washer" vs "FLAT WASHER 1/4"
+#   AND:   tokens spread across Category + Vendor + Haydon
 # =========================================================
 def tokenize_for_search(s: str) -> list[str]:
     """
@@ -84,23 +86,19 @@ def tokenize_for_search(s: str) -> list[str]:
     Keeps fractions like 1/4 as '1/4', and also adds '14' as a fallback token.
     """
     s = normalize_common(s)
-    # keep digits, letters, slash for fractions
     tokens = re.findall(r"[A-Z0-9]+(?:/[0-9]+)?", s)
 
     out = []
     for t in tokens:
         out.append(t)
-        # add fallback for fractions: 1/4 -> 14
         if "/" in t:
-            out.append(t.replace("/", ""))
-    # remove super short junk tokens
+            out.append(t.replace("/", ""))  # 1/4 -> 14
     out = [t for t in out if len(t) >= 2]
     return out
 
 def contains_all_tokens(field_value: str, tokens: list[str]) -> bool:
     """
-    Order-insensitive "contains" check.
-    We compact the field and then require all tokens to be present.
+    Order-insensitive "contains" check on a single combined field.
     """
     hay = normalize_common(field_value)
     hay_compact = re.sub(r"[^A-Z0-9/]", "", hay)
@@ -225,7 +223,6 @@ def looks_like_long_description(q: str) -> bool:
     if " " not in s:
         return False
     s2 = s.lower()
-    # strong indicators for channel/strut long descriptions
     return any(t in s2 for t in [
         'gauge', 'ga', 'galv', 'pre-galv', 'pregalv', 'hdg', 'hot dip',
         'slotted', 'channel', 'strut', 'steel', 'stainless', 'aluminum'
@@ -295,10 +292,17 @@ def load_cross_reference():
     df["CategoryKeyFull"] = df["Category"].apply(key_full)
     df["CategoryKeyBase"] = df["Category"].apply(key_base)
 
-    # Normalized raw strings used for order-insensitive token matching
+    # Normalized raw strings used for token matching
     df["HaydonNorm"] = df["Haydon Part Description"].apply(normalize_common)
     df["VendorNorm"] = df["Vendor Part #"].apply(normalize_common)
     df["CategoryNorm"] = df["Category"].apply(normalize_common)
+
+    # ✅ Combined field so tokens can match across Category + Vendor + Haydon
+    df["CombinedNorm"] = (
+        df["CategoryNorm"].fillna("") + " " +
+        df["VendorNorm"].fillna("") + " " +
+        df["HaydonNorm"].fillna("")
+    ).str.strip()
 
     return df
 
@@ -355,8 +359,7 @@ def search_parts_contains(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
     """
     Contains search that supports:
       - key-based contains (fast)
-      - AND token-based contains (order-insensitive) for phrases like:
-        '1/4 flat washer' vs 'FLAT WASHER 1/4'
+      - AND token-based contains (order-insensitive, across combined field)
     """
     q = (query or "").strip()
     if not q:
@@ -377,19 +380,12 @@ def search_parts_contains(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
     if not fast.empty:
         return fast
 
-    # 2) Token-based order-insensitive contains
+    # 2) Token-based order-insensitive contains across Category+Vendor+Haydon
     tokens = tokenize_for_search(q)
     if not tokens:
         return cross_df.iloc[0:0]
 
-    mask = cross_df.apply(
-        lambda r: (
-            contains_all_tokens(r.get("CategoryNorm", ""), tokens)
-            or contains_all_tokens(r.get("VendorNorm", ""), tokens)
-            or contains_all_tokens(r.get("HaydonNorm", ""), tokens)
-        ),
-        axis=1
-    )
+    mask = cross_df["CombinedNorm"].apply(lambda v: contains_all_tokens(v, tokens))
     return cross_df[mask]
 
 # =========================================================
@@ -411,11 +407,9 @@ def match_long_description(material_df: pd.DataFrame, query: str) -> pd.DataFram
 
     df = material_df
 
-    # Prefer framing/strut items if the column exists
     if "Material Group Name" in df.columns:
         df = df[df["Material Group Name"].astype(str).str.contains("STRUT|CHANNEL|FRAM", case=False, na=False)]
 
-    # Fast filters
     if width_in is not None and "Width" in df.columns:
         width_text = float_to_inches_str(width_in).replace(" ", "")
         df = df[df["Width"].astype(str).str.replace(" ", "").str.contains(width_text, na=False)]
@@ -483,7 +477,6 @@ def bulk_search(cross_df: pd.DataFrame, material_df: pd.DataFrame, parts: list[s
             found = search_parts_contains(cross_df, raw)
 
         if found.empty:
-            # If it looks like a long description, try matching against Material Description.xlsx
             if material_df is not None and looks_like_long_description(raw):
                 m = match_long_description(material_df, raw)
                 if not m.empty:
@@ -557,7 +550,6 @@ with tab_single:
     query = st.text_input("Enter part number (Haydon/Vendor), Category phrase, OR paste a long description:")
 
     if query:
-        # If it looks like a true strut/channel long description -> route to material file
         used_material = looks_like_long_description(query)
 
         if used_material:
@@ -581,7 +573,7 @@ with tab_single:
             else:
                 st.error("No material match found for that description.")
         else:
-            # Try exact first, then contains (contains includes token-based order-insensitive matching)
+            # Exact first, then contains (contains includes token-based order-insensitive)
             results = search_parts_exact(cross_df, query)
             if results.empty:
                 results = search_parts_contains(cross_df, query)
@@ -593,7 +585,6 @@ with tab_single:
                 st.subheader(f"Found {len(display_df)} matching entries")
                 st.dataframe(display_df, use_container_width=True)
 
-                # Sidebar: product preview / submittals for first result
                 first_row = results.iloc[0]
                 haydon_part = first_row.get("Haydon Part Description", "")
 
@@ -649,7 +640,8 @@ with tab_bulk:
                 "P1000 SL 10PG\n"
                 "H-112 X 10' HDG\n"
                 "SQUARE WASHER - 1 5/8 in x 1 5/8 in\n"
-                "1/4 flat washer\n"
+                "1/4\" SPRING NUTS\n"
+                "1/4\" flat washer\n"
                 "1-5/8\" W Channel w/ Slotted Holes - Steel Pre-Galvanized 12 Gauge"
             ),
         )
