@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import re
+from math import gcd
 import pandas as pd
 import streamlit as st
 
@@ -14,26 +15,76 @@ CROSS_FILE = BASE_DIR / "Updated File - 7-10-25.xlsx"
 IMAGES_FILE = BASE_DIR / "Image and Submittals.xlsx"
 MATERIAL_DESC_FILE = BASE_DIR / "Material Description.xlsx"
 
+# =========================================================
+# NAMING-CONVENTION AWARE NORMALIZATION
+#   - key_full: keeps finish/slot tokens
+#   - key_base: strips finish-ish tokens so variants still match
+# =========================================================
+FINISH_TOKENS = {
+    "HDG", "H.D.G", "HOTDIP", "HOT-DIP", "HOTDIPPED", "HOTDIPGALV", "HOT-DIPGALV",
+    "EG", "E.G", "ELECTRO", "ELECTROGALV", "ELECTRO-GALV", "ZINC", "ZN",
+    "PG", "PREGALV", "PRE-GALV", "PREGALVANIZED", "PRE-GALVANIZED",
+    "SS", "SST", "STAINLESS", "AL", "ALUM", "ALUMINUM", "PLAIN", "STEEL"
+}
 
-# =========================================================
-# UTILITY FUNCTIONS
-# =========================================================
-def normalize(text):
-    """Strip non-alphanumerics and lowercase for fuzzy-ish matching."""
-    if pd.isna(text):
+SLOT_TOKENS = {"OS", "OS3", "SLOT", "SLOTTED", "OPEN", "OPENSLOT", "OPEN-SLOT"}
+
+def normalize_common(s: str) -> str:
+    """Normalize punctuation/spacing so tokens are consistent for keying/matching."""
+    if pd.isna(s) or s is None:
         return ""
-    return re.sub(r"[^A-Za-z0-9]", "", str(text)).lower()
+    s = str(s).strip().upper()
 
+    # normalize curly quotes
+    s = s.replace("″", '"').replace("”", '"').replace("“", '"').replace("’", "'")
+
+    # normalize separators
+    s = s.replace("\\", "/")
+    s = re.sub(r"\s+", " ", s)
+
+    # normalize X separators: " x " -> " X "
+    s = re.sub(r"\s*[xX]\s*", " X ", s)
+
+    # normalize feet marks: 10 FT, 10FT -> 10'
+    s = re.sub(r"\b(\d{1,2})\s*(?:FT|FEET)\b", r"\1'", s)
+
+    # normalize common vendor shorthand
+    s = re.sub(r"\bw/\b", "WITH", s, flags=re.I)
+
+    return s
+
+def key_full(s: str) -> str:
+    """Full key: keep important tokens (incl. finish/slot), strip punctuation/spaces."""
+    s = normalize_common(s)
+    return re.sub(r"[^A-Z0-9]", "", s)
+
+def key_base(s: str) -> str:
+    """
+    Base key: remove finish-ish tokens so variants match:
+      H-112 X 10' <-> H-112-HDG X 10
+      P1000 SL 10 <-> P1000 SL 10PG
+    """
+    s = normalize_common(s)
+    tokens = re.split(r"[ \-_/()]+", s)
+    tokens = [t for t in tokens if t]
+
+    cleaned = []
+    for t in tokens:
+        t2 = t.replace(".", "")
+        if t2 in FINISH_TOKENS:
+            continue
+        cleaned.append(t)
+
+    return re.sub(r"[^A-Z0-9]", "", " ".join(cleaned))
 
 # =========================================================
-# LONG-DESCRIPTION PARSING (for Material Description.xlsx)
+# LONG-DESCRIPTION PARSING (Material Description.xlsx)
 # =========================================================
 UNICODE_FRACTIONS = {
     "¼": "1/4", "½": "1/2", "¾": "3/4",
     "⅛": "1/8", "⅜": "3/8", "⅝": "5/8", "⅞": "7/8",
     "⅓": "1/3", "⅔": "2/3",
 }
-
 
 def normalize_desc_text(s: str) -> str:
     s = (s or "").strip()
@@ -44,7 +95,6 @@ def normalize_desc_text(s: str) -> str:
     s = re.sub(r"\bw/\b", "with", s, flags=re.I)
     s = re.sub(r"\s+", " ", s)
     return s
-
 
 def frac_to_float(frac: str):
     """Supports 1-5/8, 1 5/8, 5/8, 1"""
@@ -66,9 +116,8 @@ def frac_to_float(frac: str):
 
     return None
 
-
 def float_to_inches_str(x: float) -> str:
-    """Best-effort normalize numeric inches back to the common text in the file (e.g., 1.625 -> 1-5/8")."""
+    """Normalize numeric inches back to common text (e.g., 1.625 -> 1-5/8")."""
     if x is None:
         return ""
     # common eighths for strut dimensions
@@ -77,14 +126,11 @@ def float_to_inches_str(x: float) -> str:
     rem = eighths % 8
     if rem == 0:
         return f"{whole}\""
-    # reduce fraction rem/8
-    from math import gcd
     g = gcd(rem, 8)
     num, den = rem // g, 8 // g
     if whole == 0:
         return f"{num}/{den}\""
     return f"{whole}-{num}/{den}\""
-
 
 def extract_width_in(desc: str):
     s = normalize_desc_text(desc)
@@ -93,34 +139,36 @@ def extract_width_in(desc: str):
         return None
     return frac_to_float(m.group("w"))
 
-
 def extract_gauge(desc: str):
     s = normalize_desc_text(desc)
     m = re.search(r"\b(\d{1,2})\s*(?:ga\.?|gauge)\b", s, flags=re.I)
     return int(m.group(1)) if m else None
 
-
 def extract_length(desc: str):
     s = normalize_desc_text(desc)
+
     # feet: 10', 10 ft, 10ft
     m = re.search(r"\b(\d{1,2})\s*(?:'|ft\b)", s, flags=re.I)
     if m:
         return f"{int(m.group(1))}'"
+
     # inches: 120", 12"
     m = re.search(r"\b(\d{1,3})\s*\"\b", s)
     if m:
         return f"{int(m.group(1))}\""
-    return None
 
+    return None
 
 def extract_finish(desc: str):
     s = normalize_desc_text(desc).upper()
-    if "PRE" in s and "GALV" in s:
+
+    # Strong, explicit patterns first
+    if ("PRE" in s and "GALV" in s) or ("PREGALV" in s) or ("PRE-GALV" in s) or ("PG" in s):
         return "Pre-Galvanized"
-    if "HOT" in s and "DIP" in s:
+    if ("HOT" in s and "DIP" in s) or ("HDG" in s):
         return "Hot Dipped Galvanized"
-    if "HDG" in s:
-        return "Hot Dipped Galvanized"
+    if "ELECTRO" in s or re.search(r"\bEG\b", s):
+        return "Electro Galvanized"
     if "PLAIN" in s and "STEEL" in s:
         return "Plain Steel"
     if "STAINLESS" in s and "316" in s:
@@ -131,11 +179,9 @@ def extract_finish(desc: str):
         return "Aluminum"
     return None
 
-
 def is_slotted(desc: str) -> bool:
     s = normalize_desc_text(desc).upper()
-    return ("SLOT" in s) or ("OPEN SLOT" in s) or ("OS" in s and "HOLE" in s)
-
+    return ("SLOT" in s) or ("OPEN SLOT" in s) or ("SLOTTED" in s) or ("SLOTTED HOLES" in s)
 
 def looks_like_long_description(q: str) -> bool:
     """Heuristic: treat as long description if it has spaces and dimension/gauge-ish tokens."""
@@ -149,14 +195,21 @@ def looks_like_long_description(q: str) -> bool:
     s2 = s.lower()
     return any(t in s2 for t in ['gauge', 'ga', 'galv', 'slotted', 'channel', 'steel', 'stainless', 'aluminum', '"', "'"])
 
+# =========================================================
+# BULK INPUT HELPERS
+# =========================================================
 def split_parts_from_text(raw: str) -> list[str]:
     """Split pasted text into part tokens (newline/comma/space separated)."""
     if not raw:
         return []
-    tokens = re.split(r"[\n,;\t ]+", raw.strip())
-    return [t.strip() for t in tokens if t.strip()]
-
-
+    tokens = re.split(r"[\n,;\t]+", raw.strip())  # keep spaces inside long descriptions
+    out = []
+    for t in tokens:
+        t = t.strip()
+        if not t:
+            continue
+        out.append(t)
+    return out
 
 def dedupe_preserve_order(items: list[str]) -> list[str]:
     seen = set()
@@ -168,17 +221,30 @@ def dedupe_preserve_order(items: list[str]) -> list[str]:
             out.append((x or "").strip())
     return out
 
-
-def get_haydon_candidates(part):
+# =========================================================
+# IMAGE/SUBMITTAL CANDIDATES (naming convention tolerant)
+# =========================================================
+def get_haydon_candidates(part: str):
     """
-    Given a Haydon part like 'H-1234-XG', progressively shorten it
-    so we can try to match in the image/submittal file.
+    Generate likely lookup variants for image/submittal Name matching.
     """
-    part = str(part).upper()
-    tokens = re.split(r"[ \-X()]+", part)
-    for i in range(len(tokens), 0, -1):
-        yield "-".join(tokens[:i])
+    p = normalize_common(part)
+    variants = set()
 
+    variants.add(p)
+    variants.add(p.replace(" X ", " X"))
+    variants.add(p.replace(" X ", "X"))
+    variants.add(p.replace("-", " - "))
+    variants.add(p.replace(" - ", "-"))
+
+    # base variant without finish tokens
+    tokens = re.split(r"[ \-_/()]+", p)
+    tokens = [t for t in tokens if t and t.replace(".", "") not in FINISH_TOKENS]
+    variants.add(" ".join(tokens))
+
+    # yield longest-first
+    for v in sorted(variants, key=len, reverse=True):
+        yield v
 
 # =========================================================
 # DATA LOADERS (CACHED)
@@ -187,11 +253,16 @@ def get_haydon_candidates(part):
 def load_cross_reference():
     if not CROSS_FILE.exists():
         raise FileNotFoundError(f"Cross-reference file not found at: {CROSS_FILE}")
-    df = pd.read_excel(CROSS_FILE, sheet_name="Export", engine="openpyxl")
-    df["Normalized Haydon Part"] = df["Haydon Part Description"].apply(normalize)
-    df["Normalized Vendor Part"] = df["Vendor Part #"].apply(normalize)
-    return df
 
+    df = pd.read_excel(CROSS_FILE, sheet_name="Export", engine="openpyxl")
+
+    # Robust keys for matching
+    df["HaydonKeyFull"] = df["Haydon Part Description"].apply(key_full)
+    df["HaydonKeyBase"] = df["Haydon Part Description"].apply(key_base)
+    df["VendorKeyFull"] = df["Vendor Part #"].apply(key_full)
+    df["VendorKeyBase"] = df["Vendor Part #"].apply(key_base)
+
+    return df
 
 @st.cache_data
 def load_images():
@@ -201,7 +272,6 @@ def load_images():
     if "Name" in df.columns:
         df["Name_upper"] = df["Name"].astype(str).str.upper()
     return df
-
 
 @st.cache_data
 def load_material_descriptions():
@@ -216,37 +286,49 @@ def load_material_descriptions():
     else:
         df["_desc_norm"] = ""
 
-    for c in ["Width", "Height", "Length", "Gauge", "Material Group 1 Name", "Material Group Name", "Material Group 3 Name"]:
+    for c in ["Width", "Height", "Length", "Gauge", "Material Group 1 Name", "Material Group Name", "Material Group 3 Name", "Weight Each"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
+
     return df
 
-
 # =========================================================
-# SEARCH
+# SEARCH (cross file)
 # =========================================================
-def search_parts_contains(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Contains search (your current behavior)."""
-    norm_query = normalize(query)
-    return cross_df[
-        cross_df["Normalized Haydon Part"].str.contains(norm_query, na=False)
-        | cross_df["Normalized Vendor Part"].str.contains(norm_query, na=False)
-    ]
-
-
 def search_parts_exact(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Exact match on normalized values (recommended for bulk)."""
-    norm_query = normalize(query)
-    if not norm_query:
+    qf = key_full(query)
+    qb = key_base(query)
+    if not qf and not qb:
         return cross_df.iloc[0:0]
+
     return cross_df[
-        (cross_df["Normalized Haydon Part"] == norm_query)
-        | (cross_df["Normalized Vendor Part"] == norm_query)
+        (cross_df["HaydonKeyFull"].eq(qf)) |
+        (cross_df["VendorKeyFull"].eq(qf)) |
+        (cross_df["HaydonKeyBase"].eq(qb)) |
+        (cross_df["VendorKeyBase"].eq(qb))
     ]
 
+def search_parts_contains(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
+    qf = key_full(query)
+    qb = key_base(query)
+    if not qf and not qb:
+        return cross_df.iloc[0:0]
 
+    return cross_df[
+        cross_df["HaydonKeyFull"].str.contains(qf, na=False) |
+        cross_df["VendorKeyFull"].str.contains(qf, na=False) |
+        cross_df["HaydonKeyBase"].str.contains(qb, na=False) |
+        cross_df["VendorKeyBase"].str.contains(qb, na=False)
+    ]
+
+# =========================================================
+# SEARCH (material file / long description)
+# =========================================================
 def match_long_description(material_df: pd.DataFrame, query: str) -> pd.DataFrame:
-    """Match a competitor long description to Haydon materials using structured attributes + scoring."""
+    """
+    Match a competitor long description to Haydon materials using
+    structured attributes + internal ranking (no score column returned).
+    """
     q = normalize_desc_text(query)
     q_up = q.upper()
 
@@ -256,16 +338,17 @@ def match_long_description(material_df: pd.DataFrame, query: str) -> pd.DataFram
     length = extract_length(q)
     slotted = is_slotted(q)
 
-    # Start with strut-ish only if we can
     df = material_df
+
+    # Prefer strut rows if the file has the category column
     if "Material Group Name" in df.columns:
-        df = df[df["Material Group Name"].astype(str).str.contains("Strut", case=False, na=False)]
+        # Keep Strut and related framing items; adjust if your file uses different terms
+        df = df[df["Material Group Name"].astype(str).str.contains("STRUT|CHANNEL|FRAM", case=False, na=False)]
 
     # Fast filters where available
     if width_in is not None and "Width" in df.columns:
-        width_text = float_to_inches_str(width_in)
-        # file stores width like 1-5/8"
-        df = df[df["Width"].astype(str).str.replace(" ", "").str.contains(width_text.replace(" ", ""), na=False)]
+        width_text = float_to_inches_str(width_in).replace(" ", "")
+        df = df[df["Width"].astype(str).str.replace(" ", "").str.contains(width_text, na=False)]
 
     if gauge is not None and "Gauge" in df.columns:
         df = df[df["Gauge"].astype(str).str.contains(str(gauge), na=False)]
@@ -274,7 +357,6 @@ def match_long_description(material_df: pd.DataFrame, query: str) -> pd.DataFram
         df = df[df["Material Group 1 Name"].astype(str).str.contains(finish, case=False, na=False)]
 
     if length and "Length" in df.columns:
-        # only filter if explicitly present
         df = df[df["Length"].astype(str).str.strip().eq(length)]
 
     if slotted and "Material Group 3 Name" in df.columns:
@@ -283,34 +365,51 @@ def match_long_description(material_df: pd.DataFrame, query: str) -> pd.DataFram
     if df.empty:
         return df
 
-    # Score candidates (helps when length is missing or multiple variants exist)
+    # Internal ranking (no score column returned)
     def score_row(r) -> int:
         s = 0
-        if width_in is not None and "Width" in r and str(r["Width"]).strip() != "nan":
+
+        if width_in is not None and "Width" in r and str(r.get("Width", "")).strip().lower() != "nan":
             if float_to_inches_str(width_in).replace(" ", "") in str(r["Width"]).replace(" ", ""):
                 s += 3
-        if gauge is not None and "Gauge" in r and str(gauge) in str(r["Gauge"]):
+
+        if gauge is not None and "Gauge" in r and str(gauge) in str(r.get("Gauge", "")):
             s += 2
-        if finish and "Material Group 1 Name" in r and finish.lower() in str(r["Material Group 1 Name"]).lower():
+
+        if finish and "Material Group 1 Name" in r and finish.lower() in str(r.get("Material Group 1 Name", "")).lower():
             s += 2
-        if slotted and "Material Group 3 Name" in r and "SLOT" in str(r["Material Group 3 Name"]).upper():
+
+        if slotted and "Material Group 3 Name" in r and "SLOT" in str(r.get("Material Group 3 Name", "")).upper():
             s += 2
-        if "CHANNEL" in q_up and "Material Description" in r and "H-132" in str(r["Material Description"]).upper():
-            # shallow channel hint
-            s += 1
+
+        # Gentle hint: if user says "W channel" prefer the common 1-5/8 x 1-5/8 family when possible
+        if ("CHANNEL" in q_up or "W CHANNEL" in q_up) and "Material Description" in r:
+            md = str(r.get("Material Description", "")).upper()
+            if "H-132" in md:
+                s += 1
+
+        # If user says "washer" prefer washer groups
+        if "WASHER" in q_up and "Material Group Name" in r:
+            if "WASH" in str(r.get("Material Group Name", "")).upper():
+                s += 2
+
         return s
 
-    scored = df.copy()
-    scored["_score"] = scored.apply(score_row, axis=1)
-    scored = scored.sort_values(by=["_score"], ascending=False)
-    return scored
+    ranked = df.copy()
+    ranked["_tmp_rank"] = ranked.apply(score_row, axis=1)
+    ranked = ranked.sort_values(by=["_tmp_rank"], ascending=False).drop(columns=["_tmp_rank"])
+    return ranked
 
-
+# =========================================================
+# BULK SEARCH
+# =========================================================
 def bulk_search(cross_df: pd.DataFrame, material_df: pd.DataFrame, parts: list[str], allow_contains_fallback: bool) -> pd.DataFrame:
     """
     Flattened output: one row per match (or one row per input if not found).
+    Includes Weight Each for Material matches (from Material Description.xlsx).
     """
     rows = []
+
     for raw in parts:
         raw = (raw or "").strip()
         if not raw:
@@ -370,8 +469,8 @@ def bulk_search(cross_df: pd.DataFrame, material_df: pd.DataFrame, parts: list[s
                         "Match Count (for Input)": len(found),
                     }
                 )
-    return pd.DataFrame(rows)
 
+    return pd.DataFrame(rows)
 
 # =========================================================
 # APP UI
@@ -392,80 +491,94 @@ tab_single, tab_bulk = st.tabs(["Single", "Bulk"])
 # SINGLE
 # =========================================================
 with tab_single:
-    query = st.text_input("Enter part number (Haydon or Vendor):")
+    query = st.text_input("Enter part number (Haydon or Vendor) OR paste a long description:")
 
     if query:
         used_material = looks_like_long_description(query)
+
         if used_material:
             m = match_long_description(material_df, query)
             if not m.empty:
                 st.subheader(f"Material matches ({min(len(m), 25)} shown)")
-                show_cols = ["Material", "Material Description", "Material Group 1 Name", "Weight Each", "Gauge", "Height", "Width", "Length"]
+                show_cols = [
+                    "Material",
+                    "Material Description",
+                    "Material Group Name",
+                    "Material Group 1 Name",
+                    "Material Group 3 Name",
+                    "Weight Each",
+                    "Gauge",
+                    "Height",
+                    "Width",
+                    "Length",
+                ]
                 show = m[[c for c in show_cols if c in m.columns]].head(25)
                 st.dataframe(show, use_container_width=True)
             else:
                 st.error("No material match found for that description.")
-            results = None
         else:
             results = search_parts_contains(cross_df, query)
 
-        if results is not None and not results.empty:
-            display_cols = ["Vendor Part #", "Vendor", "Category", "Haydon Part Description"]
-            display_df = results[[c for c in display_cols if c in results.columns]]
+            if not results.empty:
+                display_cols = ["Vendor Part #", "Vendor", "Category", "Haydon Part Description"]
+                display_df = results[[c for c in display_cols if c in results.columns]]
 
-            st.subheader(f"Found {len(display_df)} matching entries")
-            st.dataframe(display_df, use_container_width=True)
+                st.subheader(f"Found {len(display_df)} matching entries")
+                st.dataframe(display_df, use_container_width=True)
 
-            # Sidebar: product preview / submittals for first result
-            first_row = results.iloc[0]
-            haydon_part = first_row["Haydon Part Description"]
+                # Sidebar: product preview / submittals for first result
+                first_row = results.iloc[0]
+                haydon_part = first_row.get("Haydon Part Description", "")
 
-            with st.sidebar:
-                st.markdown("### Haydon Product Preview")
-                match_found = False
+                with st.sidebar:
+                    st.markdown("### Haydon Product Preview")
+                    match_found = False
 
-                candidates = [haydon_part] + list(get_haydon_candidates(haydon_part))
-                for candidate in candidates:
-                    matched = image_df[image_df["Name_upper"] == str(candidate).upper()]
-                    if not matched.empty:
-                        row = matched.iloc[0]
+                    candidates = list(get_haydon_candidates(haydon_part))
+                    for candidate in candidates:
+                        matched = image_df[image_df.get("Name_upper", "").astype(str) == str(candidate).upper()]
+                        if not matched.empty:
+                            row = matched.iloc[0]
 
-                        if "Cover Image" in row and pd.notna(row["Cover Image"]):
-                            st.image(
-                                row["Cover Image"],
-                                caption=row.get("Name", candidate),
-                                use_container_width=True,
-                            )
+                            if "Cover Image" in row and pd.notna(row["Cover Image"]):
+                                st.image(
+                                    row["Cover Image"],
+                                    caption=row.get("Name", candidate),
+                                    use_container_width=True,
+                                )
 
-                        if "Files" in row and pd.notna(row["Files"]):
-                            st.markdown(f"[View Submittal]({row['Files']})", unsafe_allow_html=True)
+                            if "Files" in row and pd.notna(row["Files"]):
+                                st.markdown(f"[View Submittal]({row['Files']})", unsafe_allow_html=True)
 
-                        match_found = True
-                        break
+                            match_found = True
+                            break
 
-                if not match_found:
-                    st.warning("No product preview or submittal found.")
-        elif results is not None:
-            st.error(
-                "No match found. Send the Haydon part number and the customer/competitor part number to "
-                "[marketing@haydoncorp.com](mailto:marketing@haydoncorp.com)."
-            )
+                    if not match_found:
+                        st.warning("No product preview or submittal found.")
+            else:
+                st.error(
+                    "No match found. Send the Haydon part number and the customer/competitor part number to "
+                    "[marketing@haydoncorp.com](mailto:marketing@haydoncorp.com)."
+                )
     else:
-        st.write("Enter a part number above to begin.")
+        st.write("Enter a part number or long description above to begin.")
 
 # =========================================================
-# BULK
+# BULK (no PDF upload)
 # =========================================================
 with tab_bulk:
-    st.markdown("Paste a list of parts (one per line, or comma/space separated) to cross-reference in bulk.")
+    st.markdown(
+        "Paste a list of parts/descriptions (one per line). "
+        "Tip: keep long descriptions on a single line."
+    )
 
     col1, col2 = st.columns(2)
 
     with col1:
         pasted = st.text_area(
-            "Paste part numbers (one per line, or comma/space separated):",
+            "Paste inputs (one per line):",
             height=220,
-            placeholder="Example:\nPS-1100-AS-4-EG\nTSN-802\nP1000",
+            placeholder="Example:\nP1000 SL 10PG\nH-112 X 10' HDG\n1-5/8\" W Channel w/ Slotted Holes - Steel Pre-Galvanized 12 Gauge",
         )
 
     with col2:
@@ -476,6 +589,7 @@ with tab_bulk:
 
     parts = []
     if pasted and pasted.strip():
+        # Split by newline/tab/comma/semicolon but preserve spaces for long descriptions
         parts.extend(split_parts_from_text(pasted))
 
     parts_unique = dedupe_preserve_order(parts)
@@ -491,8 +605,9 @@ with tab_bulk:
         st.dataframe(out_df, use_container_width=True)
 
         found_rows = int((out_df["Status"] == "Found").sum())
+        found_material_rows = int((out_df["Status"] == "Found (Material)").sum())
         not_found_rows = int((out_df["Status"] == "Not Found").sum())
-        st.write(f"Found rows: {found_rows} | Not found rows: {not_found_rows}")
+        st.write(f"Found rows: {found_rows} | Found (Material): {found_material_rows} | Not found rows: {not_found_rows}")
 
         csv_bytes = out_df.to_csv(index=False).encode("utf-8")
         st.download_button(
