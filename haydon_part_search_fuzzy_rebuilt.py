@@ -52,7 +52,7 @@ def normalize_common(s: str) -> str:
     return s
 
 def key_full(s: str) -> str:
-    """Full key: keep important tokens (incl. finish), strip punctuation/spaces."""
+    """Full key: keep important tokens, strip punctuation/spaces."""
     s = normalize_common(s)
     return re.sub(r"[^A-Z0-9]", "", s)
 
@@ -76,6 +76,42 @@ def key_base(s: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", " ".join(cleaned))
 
 # =========================================================
+# ORDER-INSENSITIVE TOKEN MATCHING (fixes: "1/4 flat washer" vs "FLAT WASHER 1/4")
+# =========================================================
+def tokenize_for_search(s: str) -> list[str]:
+    """
+    Tokenize text for order-insensitive matching.
+    Keeps fractions like 1/4 as '1/4', and also adds '14' as a fallback token.
+    """
+    s = normalize_common(s)
+    # keep digits, letters, slash for fractions
+    tokens = re.findall(r"[A-Z0-9]+(?:/[0-9]+)?", s)
+
+    out = []
+    for t in tokens:
+        out.append(t)
+        # add fallback for fractions: 1/4 -> 14
+        if "/" in t:
+            out.append(t.replace("/", ""))
+    # remove super short junk tokens
+    out = [t for t in out if len(t) >= 2]
+    return out
+
+def contains_all_tokens(field_value: str, tokens: list[str]) -> bool:
+    """
+    Order-insensitive "contains" check.
+    We compact the field and then require all tokens to be present.
+    """
+    hay = normalize_common(field_value)
+    hay_compact = re.sub(r"[^A-Z0-9/]", "", hay)
+
+    for tok in tokens:
+        tok_compact = re.sub(r"[^A-Z0-9/]", "", str(tok).upper())
+        if tok_compact and tok_compact not in hay_compact:
+            return False
+    return True
+
+# =========================================================
 # LONG-DESCRIPTION PARSING (Material Description.xlsx)
 # =========================================================
 UNICODE_FRACTIONS = {
@@ -88,7 +124,6 @@ def normalize_desc_text(s: str) -> str:
     s = (s or "").strip()
     for k, v in UNICODE_FRACTIONS.items():
         s = s.replace(k, v)
-    # normalize curly quotes to inch mark
     s = s.replace("″", '"').replace("”", '"').replace("“", '"').replace("’", "'")
     s = re.sub(r"\bw/\b", "with", s, flags=re.I)
     s = re.sub(r"\s+", " ", s)
@@ -179,21 +214,22 @@ def is_slotted(desc: str) -> bool:
 
 def looks_like_long_description(q: str) -> bool:
     """
-    Heuristic: treat as long description if it looks like a sentence/product phrase
-    with material/finish/dimension keywords. (Avoid routing simple short labels to material matcher.)
+    Route to Material Description matcher only when it really looks like
+    a strut/channel long description (avoid routing washer/category phrases).
     """
     if not q:
         return False
     s = str(q).strip()
-    if len(s) < 12:
+    if len(s) < 14:
         return False
     if " " not in s:
         return False
     s2 = s.lower()
+    # strong indicators for channel/strut long descriptions
     return any(t in s2 for t in [
         'gauge', 'ga', 'galv', 'pre-galv', 'pregalv', 'hdg', 'hot dip',
-        'slotted', 'channel', 'strut', 'steel', 'stainless', 'aluminum', '"', "'"
-    ])
+        'slotted', 'channel', 'strut', 'steel', 'stainless', 'aluminum'
+    ]) and (('"') in s or ("'") in s or (" in " in s2) or (" x " in s2))
 
 # =========================================================
 # BULK INPUT HELPERS
@@ -256,9 +292,13 @@ def load_cross_reference():
     df["VendorKeyFull"] = df["Vendor Part #"].apply(key_full)
     df["VendorKeyBase"] = df["Vendor Part #"].apply(key_base)
 
-    # ✅ Category is where many descriptive entries live (washers, etc.)
     df["CategoryKeyFull"] = df["Category"].apply(key_full)
     df["CategoryKeyBase"] = df["Category"].apply(key_base)
+
+    # Normalized raw strings used for order-insensitive token matching
+    df["HaydonNorm"] = df["Haydon Part Description"].apply(normalize_common)
+    df["VendorNorm"] = df["Vendor Part #"].apply(normalize_common)
+    df["CategoryNorm"] = df["Category"].apply(normalize_common)
 
     return df
 
@@ -312,12 +352,21 @@ def search_parts_exact(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
     ]
 
 def search_parts_contains(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
-    qf = key_full(query)
-    qb = key_base(query)
-    if not qf and not qb:
+    """
+    Contains search that supports:
+      - key-based contains (fast)
+      - AND token-based contains (order-insensitive) for phrases like:
+        '1/4 flat washer' vs 'FLAT WASHER 1/4'
+    """
+    q = (query or "").strip()
+    if not q:
         return cross_df.iloc[0:0]
 
-    return cross_df[
+    qf = key_full(q)
+    qb = key_base(q)
+
+    # 1) Fast key-based contains
+    fast = cross_df[
         cross_df["HaydonKeyFull"].str.contains(qf, na=False) |
         cross_df["VendorKeyFull"].str.contains(qf, na=False) |
         cross_df["CategoryKeyFull"].str.contains(qf, na=False) |
@@ -325,6 +374,23 @@ def search_parts_contains(cross_df: pd.DataFrame, query: str) -> pd.DataFrame:
         cross_df["VendorKeyBase"].str.contains(qb, na=False) |
         cross_df["CategoryKeyBase"].str.contains(qb, na=False)
     ]
+    if not fast.empty:
+        return fast
+
+    # 2) Token-based order-insensitive contains
+    tokens = tokenize_for_search(q)
+    if not tokens:
+        return cross_df.iloc[0:0]
+
+    mask = cross_df.apply(
+        lambda r: (
+            contains_all_tokens(r.get("CategoryNorm", ""), tokens)
+            or contains_all_tokens(r.get("VendorNorm", ""), tokens)
+            or contains_all_tokens(r.get("HaydonNorm", ""), tokens)
+        ),
+        axis=1
+    )
+    return cross_df[mask]
 
 # =========================================================
 # SEARCH (material file / long description)
@@ -491,6 +557,7 @@ with tab_single:
     query = st.text_input("Enter part number (Haydon/Vendor), Category phrase, OR paste a long description:")
 
     if query:
+        # If it looks like a true strut/channel long description -> route to material file
         used_material = looks_like_long_description(query)
 
         if used_material:
@@ -514,7 +581,10 @@ with tab_single:
             else:
                 st.error("No material match found for that description.")
         else:
-            results = search_parts_contains(cross_df, query)
+            # Try exact first, then contains (contains includes token-based order-insensitive matching)
+            results = search_parts_exact(cross_df, query)
+            if results.empty:
+                results = search_parts_contains(cross_df, query)
 
             if not results.empty:
                 display_cols = ["Vendor Part #", "Vendor", "Category", "Haydon Part Description"]
@@ -574,7 +644,14 @@ with tab_bulk:
         pasted = st.text_area(
             "Paste inputs (one per line):",
             height=220,
-            placeholder="Example:\nP1000 SL 10PG\nH-112 X 10' HDG\nSQUARE WASHER - 1 5/8 in x 1 5/8 in\n1-5/8\" W Channel w/ Slotted Holes - Steel Pre-Galvanized 12 Gauge",
+            placeholder=(
+                "Example:\n"
+                "P1000 SL 10PG\n"
+                "H-112 X 10' HDG\n"
+                "SQUARE WASHER - 1 5/8 in x 1 5/8 in\n"
+                "1/4 flat washer\n"
+                "1-5/8\" W Channel w/ Slotted Holes - Steel Pre-Galvanized 12 Gauge"
+            ),
         )
 
     with col2:
